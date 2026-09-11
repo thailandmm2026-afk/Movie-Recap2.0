@@ -1,233 +1,285 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Myanmar TTS Video Bot with HTML Subtitle Editor & Subscription System
-- Users must buy subscription (10d / 15d / 1m / 3m / 5m / 1y)
-- Admin can edit prices, set KPay/Wave numbers, manage users
-- Web HTML integration for custom subtitle editing & preview
-"""
-
-import os
-import logging
-import asyncio
-import time
-import subprocess
-import re
-import json
-import sys
-import warnings
-import sqlite3
-import html
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-from asyncio import Semaphore
-
-warnings.filterwarnings("ignore")
-
-for logger_name in ['urllib3', 'requests', 'telebot', 'edge_tts', 'asyncio', 'httpx', 'httpcore', 'telegram', 'moviepy', 'yt_dlp', 'whisper']:
-    logging.getLogger(logger_name).setLevel(logging.CRITICAL)
-
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, WebAppInfo
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ApplicationHandlerStop
-from telegram.constants import ParseMode
-
-from moviepy.editor import VideoFileClip, AudioFileClip
-from pydub import AudioSegment
-import yt_dlp
-import whisper
-from deep_translator import GoogleTranslator
-import edge_tts
-
-# =========================================================
-# CONFIG - CHANGE THESE
-# =========================================================
-BOT_TOKEN = "8840689115:AAGv4QXodzIJ4UO17sWY-x_pKNtB3hdAviM"   # <-- your bot token
-WEBAPP_URL = "https://yourdomain.com/index.html"                 # <-- Web App HTML URL (Hosting address)
-
-# Admin Telegram user IDs (add your own ID here)
-ADMIN_IDS = [7308292609]
-
-DEFAULT_KPAY = "09xxxxxxxxx"
-DEFAULT_WAVE = "09xxxxxxxxx"
-
-DEFAULT_PLANS = {
-    "10d":  {"name": "၁၀ ရက်",   "days": 10,  "price": 3000},
-    "15d":  {"name": "၁၅ ရက်",   "days": 15,  "price": 4000},
-    "1m":   {"name": "၁ လ",      "days": 30,  "price": 7000},
-    "3m":   {"name": "၃ လ",      "days": 90,  "price": 18000},
-    "5m":   {"name": "၅ လ",      "days": 150, "price": 28000},
-    "1y":   {"name": "၁ နှစ်",    "days": 365, "price": 50000},
+<!DOCTYPE html>
+<html lang="my">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Myanmar TTS Video Bot Dashboard</title>
+<!-- Tailwind CSS CDN -->
+<script src="[https://cdn.tailwindcss.com](https://cdn.tailwindcss.com)"></script>
+<!-- FontAwesome CDN -->
+<link rel="stylesheet" href="[https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css](https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css)">
+<!-- Google Fonts (Pyidaungsu / Noto Sans Myanmar) -->
+<link href="[https://fonts.googleapis.com/css2?family=Pyidaungsu:wght@400;700&display=swap](https://fonts.googleapis.com/css2?family=Pyidaungsu:wght@400;700&display=swap)" rel="stylesheet">
+<style>
+body {
+font-family: 'Pyidaungsu', sans-serif;
+background-color: #0f172a;
+color: #f8fafc;
 }
-
-PREMIUM_EMOJI_IDS = {
-    "✅": "6087158252703850104",
-    "⏳": "6224324157924975216",
-    "⌛": "6224324157924975216",
-    "❌": "6086616567133509891",
-    "📦": "6185914385655930182",
-    "🎬": "5375464961822695044",
-    "📝": "6102503603916774694",
-    "🛒": "6221954521388556644",
-    "⚙️": "6102446132959387332",
-    "💰": "6102775243418378788",
-    "✨": "6224324157924975216",
-    "🚀": "6221964464237846356",
+.glass-card {
+background: rgba(30, 41, 59, 0.7);
+backdrop-filter: blur(12px);
+border: 1px solid rgba(255, 255, 255, 0.1);
 }
-
-EMOJI_SLOTS = {
-    "1":  {"key": "success",    "name": "✅ ပြီးဆုံး / Success", "default": "✅"},
-    "2":  {"key": "processing", "name": "⏳ စောင့်ဆိုင်း",         "default": "⏳"},
-    "3":  {"key": "error",      "name": "❌ အမှား",               "default": "❌"},
-    "4":  {"key": "package",    "name": "📦 Package",             "default": "📦"},
-    "5":  {"key": "video",      "name": "🎬 Video",               "default": "🎬"},
-    "6":  {"key": "text",       "name": "📝 စာသား",              "default": "📝"},
-    "7":  {"key": "buy",        "name": "🛒 ဝယ်ယူ",               "default": "🛒"},
-    "8":  {"key": "settings",   "name": "⚙️ ဆက်တင်",             "default": "⚙️"},
-}
-pending_emoji_for_admin = {}
-
-def premium_emoji_html(emoji_id, fallback="✨") -> str:
-    if emoji_id:
-        return f'<tg-emoji emoji-id="{html.escape(str(emoji_id), quote=True)}">{fallback}</tg-emoji>'
-    return fallback
-
-def premiumize_text(text: str) -> str:
-    if not text or "<tg-emoji" in text:
-        return text
-    result = text
-    for emoji_char in sorted(PREMIUM_EMOJI_IDS.keys(), key=len, reverse=True):
-        eid = PREMIUM_EMOJI_IDS[emoji_char]
-        tag = premium_emoji_html(eid, emoji_char)
-        result = result.replace(emoji_char, tag)
-    return result
-
-# =========================================================
-# GLOBALS & DATABASE
-# =========================================================
-executor = ThreadPoolExecutor(max_workers=10)
-TEMP_FOLDER = "temp_files"
-os.makedirs(TEMP_FOLDER, exist_ok=True)
-
-whisper_model = None
-whisper_lock = asyncio.Lock()
-DB_FILE = "cook_data.db"
-
-VOICES = {
-    "thiha": {"id": "my-MM-ThihaNeural", "name": "Thiha", "gender": "ကျား", "emoji": "👨"},
-    "nilar": {"id": "my-MM-NilarNeural", "name": "Nilar", "gender": "မ", "emoji": "👩"}
-}
-DEFAULT_VOICE = "thiha"
-DEFAULT_SPEED = 1.4
-
-def get_db_connection():
-    return sqlite3.connect(DB_FILE, timeout=60, check_same_thread=False)
-
-def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, voice TEXT DEFAULT 'thiha', speed REAL DEFAULT 1.4, mode TEXT DEFAULT 'auto', is_banned INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS plans (plan_id TEXT PRIMARY KEY, name TEXT NOT NULL, days INTEGER NOT NULL, price INTEGER NOT NULL, is_active INTEGER DEFAULT 1)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, plan_id TEXT, start_date TIMESTAMP, end_date TIMESTAMP, is_active INTEGER DEFAULT 1, activated_by TEXT DEFAULT 'admin', note TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, plan_id TEXT, amount INTEGER, method TEXT, status TEXT DEFAULT 'pending', screenshot_file_id TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, video_path TEXT, audio_path TEXT, srt_path TEXT, transcript_text TEXT, translated_text TEXT, edited_text TEXT, video_duration REAL, is_voice BOOLEAN DEFAULT 0, mode TEXT DEFAULT 'auto', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    conn.commit()
-    conn.close()
-
-def ensure_user(user_id, username=None, first_name=None):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id FROM users WHERE user_id = ?', (user_id,))
-    if not cursor.fetchone():
-        cursor.execute('INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)', (user_id, username, first_name))
-    conn.commit()
-    conn.close()
-
-def get_user(user_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT voice, speed, mode, is_banned, username, first_name FROM users WHERE user_id = ?', (user_id,))
-    r = cursor.fetchone()
-    conn.close()
-    if r:
-        return {'voice': r[0], 'speed': r[1], 'mode': r[2] or 'auto', 'is_banned': bool(r[3]), 'username': r[4], 'first_name': r[5]}
-    return None
-
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
-
-def get_active_subscription(user_id):
-    if is_admin(user_id):
-        return True
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM subscriptions WHERE user_id = ? AND is_active = 1 AND end_date > datetime('now')", (user_id,))
-    r = cursor.fetchone()
-    conn.close()
-    return r is not None
-
-def get_setting(key, default=""):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
-    r = cursor.fetchone()
-    conn.close()
-    return r[0] if r else default
-
-def set_setting(key, value):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, value))
-    conn.commit()
-    conn.close()
-
-def get_session(user_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT video_path, audio_path, srt_path, edited_text, video_duration FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', (user_id,))
-    r = cursor.fetchone()
-    conn.close()
-    if r:
-        return {'video_path': r[0], 'audio_path': r[1], 'srt_path': r[2], 'edited_text': r[3], 'video_duration': r[4]}
-    return None
-
-# =========================================================
-# HANDLERS & WEB APP INTEGRATION
-# =========================================================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user.id, user.username, user.first_name)
-    
-    keyboard = [
-        [InlineKeyboardButton("🎬 ဗီဒီယို စာတန်းထိုးပြင်ရန် (HTML Web App)", web_app=WebAppInfo(url=WEBAPP_URL))],
-        [InlineKeyboardButton("🛒 Package ဝယ်ရန်", callback_data="show_buy")],
-        [InlineKeyboardButton("⚙️ ဆက်တင်များ", callback_data="show_settings")]
-    ]
-    
-    text = (
-        f"👋 မင်္ဂလာပါ Bro <b>{html.escape(user.first_name or 'User')}</b>!\n\n"
-        f"🎬 <b>YouTube / TikTok / Video</b> များကို မြန်မာလို အသံသွင်းခြင်းနှင့် **HTML Web App** ဖြင့် စာတန်းထိုးများိတ်ကြိုက် တည်းဖြတ်နိုင်ပါပြီ။\n\n"
-        f"အောက်ပါခလုတ်ကိုနှိပ်၍ စာတန်းထိုးများကို စိတ်ကြိုက်ပြင်ဆင်နိုင်ပါသည်။"
-    )
-    await update.message.reply_text(premiumize_text(text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
-
-# =========================================================
-# MAIN ENTRY
-# =========================================================
-def main():
-    init_db()
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    
-    logger.info("Bot is running with HTML WebApp integration...")
-    application.run_polling()
-
-if __name__ == "__main__":
-    main()
+</style>
+</head>
+<body class="min-h-screen flex flex-col">
+<!-- Top Navigation -->
+<header class="glass-card sticky top-0 z-50 border-b border-slate-800">
+<div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+<div class="flex items-center space-x-3">
+<div class="bg-indigo-600 p-2 rounded-xl text-white shadow-lg shadow-indigo-500/30">
+<i class="fa-solid fa-video text-xl"></i>
+</div>
+<div>
+<h1 class="font-bold text-lg tracking-wide text-white">MM TTS Video Bot</h1>
+<p class="text-xs text-slate-400">Subscription & Management Dashboard</p>
+</div>
+</div>
+<div class="flex items-center space-x-4">
+<span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+<span class="w-2 h-2 mr-2 bg-emerald-400 rounded-full animate-pulse"></span> Bot Active
+</span>
+</div>
+</div>
+</header>
+<!-- Main Container -->
+<main class="flex-grow max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+<!-- Stats Overview Grid -->
+<section class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
+<!-- Total Users -->
+<div class="glass-card rounded-2xl p-5 shadow-xl transition-all hover:scale-[1.02]">
+<div class="flex items-center justify-between">
+<div>
+<p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Total Users</p>
+<h3 class="text-2xl font-bold mt-1 text-white">1,248</h3>
+</div>
+<div class="p-3 bg-blue-500/10 text-blue-400 rounded-xl border border-blue-500/20">
+<i class="fa-solid fa-users text-xl"></i>
+</div>
+</div>
+<div class="mt-4 flex items-center text-xs text-emerald-400">
+<i class="fa-solid fa-arrow-trend-up mr-1"></i> +12% from last week
+</div>
+</div>
+<!-- Active Subscriptions -->
+<div class="glass-card rounded-2xl p-5 shadow-xl transition-all hover:scale-[1.02]">
+<div class="flex items-center justify-between">
+<div>
+<p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Active Subscriptions</p>
+<h3 class="text-2xl font-bold mt-1 text-emerald-400">342</h3>
+</div>
+<div class="p-3 bg-emerald-500/10 text-emerald-400 rounded-xl border border-emerald-500/20">
+<i class="fa-solid fa-crown text-xl"></i>
+</div>
+</div>
+<div class="mt-4 flex items-center text-xs text-slate-400">
+<i class="fa-solid fa-circle-check mr-1 text-emerald-400"></i> Fully operational
+</div>
+</div>
+<!-- Pending Payments -->
+<div class="glass-card rounded-2xl p-5 shadow-xl transition-all hover:scale-[1.02]">
+<div class="flex items-center justify-between">
+<div>
+<p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Pending Payments</p>
+<h3 class="text-2xl font-bold mt-1 text-amber-400">7</h3>
+</div>
+<div class="p-3 bg-amber-500/10 text-amber-400 rounded-xl border border-amber-500/20">
+<i class="fa-solid fa-clock text-xl"></i>
+</div>
+</div>
+<div class="mt-4 flex items-center text-xs text-amber-400">
+<i class="fa-solid fa-triangle-exclamation mr-1"></i> Requires approval
+</div>
+</div>
+<!-- System Revenue -->
+<div class="glass-card rounded-2xl p-5 shadow-xl transition-all hover:scale-[1.02]">
+<div class="flex items-center justify-between">
+<div>
+<p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Total Revenue</p>
+<h3 class="text-2xl font-bold mt-1 text-indigo-400">2,450,000 Ks</h3>
+</div>
+<div class="p-3 bg-indigo-500/10 text-indigo-400 rounded-xl border border-indigo-500/20">
+<i class="fa-solid fa-wallet text-xl"></i>
+</div>
+</div>
+<div class="mt-4 flex items-center text-xs text-indigo-400">
+<i class="fa-solid fa-arrow-trend-up mr-1"></i> KPay & Wave Money
+</div>
+</div>
+</section>
+<!-- Configuration & Plans Management -->
+<section class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+<!-- Payment Gateway Settings -->
+<div class="glass-card rounded-2xl p-6 shadow-xl space-y-6">
+<div class="flex items-center justify-between border-b border-slate-800 pb-4">
+<h2 class="text-lg font-bold text-white flex items-center">
+<i class="fa-solid fa-gear text-indigo-400 mr-2"></i> Payment Settings
+</h2>
+</div>
+<form class="space-y-4">
+<div>
+<label class="block text-xs font-medium text-slate-400 mb-1">KPay Phone Number</label>
+<div class="relative">
+<span class="absolute inset-y-0 left-0 pl-3 flex items-center text-slate-500">
+<i class="fa-solid fa-mobile-screen"></i>
+</span>
+<input type="text" value="09977889966" class="w-full bg-slate-900 border border-slate-700 rounded-xl pl-10 pr-4 py-2.5 text-sm text-white focus:outline-none focus:border-indigo-500">
+</div>
+</div>
+<div>
+<label class="block text-xs font-medium text-slate-400 mb-1">Wave Money Phone Number</label>
+<div class="relative">
+<span class="absolute inset-y-0 left-0 pl-3 flex items-center text-slate-500">
+<i class="fa-solid fa-wallet"></i>
+</span>
+<input type="text" value="09443322111" class="w-full bg-slate-900 border border-slate-700 rounded-xl pl-10 pr-4 py-2.5 text-sm text-white focus:outline-none focus:border-indigo-500">
+</div>
+</div>
+<button type="button" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2.5 rounded-xl transition-all shadow-lg shadow-indigo-600/30 text-sm">
+<i class="fa-solid fa-floppy-disk mr-2"></i> Save Settings
+</button>
+</form>
+</div>
+<!-- Subscription Plans Pricing -->
+<div class="glass-card rounded-2xl p-6 shadow-xl space-y-6 lg:col-span-2">
+<div class="flex items-center justify-between border-b border-slate-800 pb-4">
+<h2 class="text-lg font-bold text-white flex items-center">
+<i class="fa-solid fa-box-archive text-emerald-400 mr-2"></i> Subscription Plans & Pricing
+</h2>
+<span class="text-xs text-slate-400">Editable Tiers</span>
+</div>
+<div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+<!-- 10d Plan -->
+<div class="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex flex-col justify-between">
+<div>
+<span class="text-xs text-indigo-400 font-semibold">10 Days</span>
+<h4 class="text-base font-bold text-white mt-1">၁၀ ရက်</h4>
+<p class="text-xl font-extrabold text-emerald-400 mt-2">3,000 ကျပ်</p>
+</div>
+<button class="mt-4 bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 py-1.5 px-3 rounded-lg border border-slate-700 transition-all">
+Edit Price
+</button>
+</div>
+<!-- 15d Plan -->
+<div class="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex flex-col justify-between">
+<div>
+<span class="text-xs text-indigo-400 font-semibold">15 Days</span>
+<h4 class="text-base font-bold text-white mt-1">၁၅ ရက်</h4>
+<p class="text-xl font-extrabold text-emerald-400 mt-2">4,000 ကျပ်</p>
+</div>
+<button class="mt-4 bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 py-1.5 px-3 rounded-lg border border-slate-700 transition-all">
+Edit Price
+</button>
+</div>
+<!-- 1m Plan -->
+<div class="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex flex-col justify-between">
+<div>
+<span class="text-xs text-indigo-400 font-semibold">1 Month</span>
+<h4 class="text-base font-bold text-white mt-1">၁ လ</h4>
+<p class="text-xl font-extrabold text-emerald-400 mt-2">7,000 ကျပ်</p>
+</div>
+<button class="mt-4 bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 py-1.5 px-3 rounded-lg border border-slate-700 transition-all">
+Edit Price
+</button>
+</div>
+<!-- 3m Plan -->
+<div class="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex flex-col justify-between">
+<div>
+<span class="text-xs text-indigo-400 font-semibold">3 Months</span>
+<h4 class="text-base font-bold text-white mt-1">၃ လ</h4>
+<p class="text-xl font-extrabold text-emerald-400 mt-2">18,000 ကျပ်</p>
+</div>
+<button class="mt-4 bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 py-1.5 px-3 rounded-lg border border-slate-700 transition-all">
+Edit Price
+</button>
+</div>
+<!-- 5m Plan -->
+<div class="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex flex-col justify-between">
+<div>
+<span class="text-xs text-indigo-400 font-semibold">5 Months</span>
+<h4 class="text-base font-bold text-white mt-1">၅ လ</h4>
+<p class="text-xl font-extrabold text-emerald-400 mt-2">28,000 ကျပ်</p>
+</div>
+<button class="mt-4 bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 py-1.5 px-3 rounded-lg border border-slate-700 transition-all">
+Edit Price
+</button>
+</div>
+<!-- 1y Plan -->
+<div class="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex flex-col justify-between">
+<div>
+<span class="text-xs text-indigo-400 font-semibold">1 Year</span>
+<h4 class="text-base font-bold text-white mt-1">၁ နှစ်</h4>
+<p class="text-xl font-extrabold text-emerald-400 mt-2">50,000 ကျပ်</p>
+</div>
+<button class="mt-4 bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 py-1.5 px-3 rounded-lg border border-slate-700 transition-all">
+Edit Price
+</button>
+</div>
+</div>
+</div>
+</section>
+<!-- Recent Pending Payments Table -->
+<section class="glass-card rounded-2xl p-6 shadow-xl space-y-6">
+<div class="flex items-center justify-between border-b border-slate-800 pb-4">
+<h2 class="text-lg font-bold text-white flex items-center">
+<i class="fa-solid fa-list-check text-amber-400 mr-2"></i> Pending Payment Approvals
+</h2>
+<span class="text-xs px-2.5 py-1 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 font-medium">7 Pending</span>
+</div>
+<div class="overflow-x-auto">
+<table class="w-full text-left text-sm">
+<thead class="bg-slate-900/60 text-slate-400 uppercase text-xs tracking-wider border-b border-slate-800">
+<tr>
+<th class="py-3 px-4">Payment ID</th>
+<th class="py-3 px-4">User ID / Name</th>
+<th class="py-3 px-4">Package</th>
+<th class="py-3 px-4">Amount</th>
+<th class="py-3 px-4">Method</th>
+<th class="py-3 px-4 text-center">Actions</th>
+</tr>
+</thead>
+<tbody class="divide-y divide-slate-800 text-slate-300">
+<tr class="hover:bg-slate-800/40 transition-colors">
+<td class="py-3 px-4 font-mono text-indigo-400">#1042</td>
+<td class="py-3 px-4"><code>7308292609</code>
+<span class="text-xs text-slate-500">Kaung Sai Thu Aung</span></td>
+<td class="py-3 px-4 font-semibold text-white">၁ လ (1m)</td>
+<td class="py-3 px-4 text-emerald-400 font-bold">7,000 ကျပ်</td>
+<td class="py-3 px-4"><span class="px-2 py-1 bg-blue-500/10 text-blue-400 rounded-md text-xs border border-blue-500/20">KPay</span></td>
+<td class="py-3 px-4 text-center space-x-2">
+<button class="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-medium shadow-md shadow-emerald-600/20 transition-all">
+<i class="fa-solid fa-check mr-1"></i> Approve
+</button>
+<button class="px-3 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-medium shadow-md shadow-rose-600/20 transition-all">
+<i class="fa-solid fa-xmark mr-1"></i> Reject
+</button>
+</td>
+</tr>
+<tr class="hover:bg-slate-800/40 transition-colors">
+<td class="py-3 px-4 font-mono text-indigo-400">#1043</td>
+<td class="py-3 px-4"><code>5892147302</code>
+<span class="text-xs text-slate-500">Alex Tun</span></td>
+<td class="py-3 px-4 font-semibold text-white">၃ လ (3m)</td>
+<td class="py-3 px-4 text-emerald-400 font-bold">18,000 ကျပ်</td>
+<td class="py-3 px-4"><span class="px-2 py-1 bg-amber-500/10 text-amber-400 rounded-md text-xs border border-amber-500/20">Wave Money</span></td>
+<td class="py-3 px-4 text-center space-x-2">
+<button class="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-medium shadow-md shadow-emerald-600/20 transition-all">
+<i class="fa-solid fa-check mr-1"></i> Approve
+</button>
+<button class="px-3 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-medium shadow-md shadow-rose-600/20 transition-all">
+<i class="fa-solid fa-xmark mr-1"></i> Reject
+</button>
+</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</main>
+<!-- Footer -->
+<footer class="glass-card mt-12 py-4 border-t border-slate-800 text-center text-xs text-slate-500">
+Myanmar TTS Video Bot • Secure HTML Dashboard © 2026
+</footer>
+</body>
+</html>
